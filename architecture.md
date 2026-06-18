@@ -1,30 +1,30 @@
-# Self-Healing HR Ops Platform - Architecture Brief
+# Self-Healing HR Ops Platform - Production Architecture
 
 ## 1. Scope
 
-This design targets the Darwinbox advanced assignment: an agentic HR operations engine that can react to natural-language requests, run scheduled anomaly scans, consume upstream system alerts, execute guarded corrective actions, and learn from human feedback over time.
+This document describes a production-grade Darwinbox HR operations intelligence layer. The platform reacts to natural-language requests, runs scheduled and streaming anomaly scans, consumes upstream system alerts, executes guarded corrective actions, and continuously improves action recommendations from human feedback and operational outcomes.
 
-The implementation is a single Python 3.11+ repo with generated mock artifacts: 500-1,000 employees, 3-5 pages of HR policy documents, seeded payroll/attendance/leave/performance data, and a FastAPI mock API spec. The architecture is local-first for the demo, but each storage and orchestration choice has a clear production replacement.
+The design assumes multi-tenant enterprise scale: millions of employees, hundreds of customers, multiple jurisdictions, strict auditability, tenant data isolation, high availability, and explicit controls around payroll and compliance side effects. The Python services use typed interfaces and durable infrastructure rather than in-memory or notebook-style orchestration.
 
 Companion contract docs:
 
 - [interface-contracts.md](interface-contracts.md) defines the Pydantic interfaces and example payloads for signals, RAG chunks, anomalies, RL decisions, HITL packets, incidents, resolutions, rewards, tools, and graph state.
 - [llm-instructions.md](llm-instructions.md) defines the LLM instruction contracts and structured outputs for Supervisor triage, RAG synthesis, verification, reviewer narrative, and final user response.
 
-## 2. Requirement Mapping
+## 2. Capability Mapping
 
-| Requirement | Design choice |
+| Capability | Design choice |
 |---|---|
 | Supervisor plus at least 4 sub-agents | LangGraph `StateGraph` with Supervisor, Policy Agent, Anomaly Detection Agent, Compliance Agent, Action Agent, plus Memory nodes |
 | No direct agent-to-agent calls | Agents only read and write shared `GraphState`; conditional graph edges route all transitions |
-| Three trigger classes | Reactive REST/chat requests, APScheduler scans, and FastAPI alert webhooks all normalize into one `Signal` envelope |
-| RAG grounded in HR policies | Chroma policy index, header-aware chunking, cited answers, and "not covered" fallback for missing policy support |
+| Three trigger classes | Reactive REST/chat requests, scheduled workflows, and event/webhook alerts all normalize into one `Signal` envelope |
+| RAG grounded in HR policies | Managed vector index, header-aware chunking, cited answers, and "not covered" fallback for missing policy support |
 | Anomaly detection with confidence and action | Deterministic statistics/rules produce calibrated confidence and a 5-action candidate set |
 | RL feedback layer | Contextual bandit ranks the 5 actions and updates from HITL, outcomes, false positives, and compliance vetoes |
-| HITL approval | LangGraph `interrupt()` pauses high-risk or low-confidence decisions; FastAPI/Streamlit reviewer UI resumes runs |
-| Compliance rules | 10-15 YAML rules evaluated by a pure Python rules engine; hard vetoes cannot be overridden |
-| Episodic memory | Chroma stores resolved incidents and warm-starts action ranking for similar future cases |
-| Observability and evals | Structured traces, 15-case evaluation harness, RL diagnostics, token/cost ledger, and cost comparison mode |
+| HITL approval | LangGraph `interrupt()` pauses high-risk or low-confidence decisions; approval API and reviewer console resume runs |
+| Compliance rules | Versioned rule registry evaluated by a deterministic rules service; hard vetoes cannot be overridden |
+| Episodic memory | Managed vector store persists resolved incidents and warm-starts action ranking for similar future cases |
+| Observability and evaluation | Structured traces, offline/online evaluation, RL diagnostics, token/cost ledger, and production SLOs |
 
 ## 3. High-Level Flow
 
@@ -32,17 +32,17 @@ At the highest level, the system is a stateful workflow engine wrapped around HR
 
 ```text
                                   +-----------------------------+
-                                  | Generated artifacts         |
-                                  | SQLite: HR data             |
-                                  | Markdown/PDF: policies      |
-                                  | YAML: compliance rules      |
+                                  | Enterprise data sources     |
+                                  | HRIS/payroll/attendance     |
+                                  | policy docs + rule registry |
+                                  | audit labels + outcomes     |
                                   +--------------+--------------+
                                                  |
                                                  v
 +----------------------+  +----------------------+  +----------------------+
 | Reactive request     |  | Scheduled scan       |  | System alert         |
-| Streamlit chat       |  | APScheduler          |  | FastAPI webhook      |
-| FastAPI REST         |  | logical demo cycles  |  | mock upstream API    |
+| Web/mobile/API       |  | Temporal/Airflow     |  | Kafka/webhook/event  |
+| API Gateway/FastAPI  |  | batch + streaming    |  | upstream platforms   |
 +----------+-----------+  +----------+-----------+  +----------+-----------+
            |                         |                         |
            +------------ normalize into typed Signal -----------+
@@ -51,7 +51,7 @@ At the highest level, the system is a stateful workflow engine wrapped around HR
                             +--------+---------+
                             | LangGraph        |
                             | StateGraph       |
-                            | SQLite checkpoint|
+                            | Postgres checkpoint|
                             +--------+---------+
                                      |
                                      v
@@ -67,8 +67,8 @@ At the highest level, the system is a stateful workflow engine wrapped around HR
         +--------+--------+ +--------+--------+ +--------+--------+
         | Policy Agent    | | Anomaly Agent   | | Action request  |
         | RAG             | | pandas/numpy    | | Pydantic schema |
-        | Chroma policies | | robust scoring  | | validation      |
-        | local embeddings| | calibrated conf | | tool params     |
+        | managed vector  | | SQL/Spark/Python| | validation      |
+        | embedding svc   | | calibrated conf | | tool params     |
         +--------+--------+ +--------+--------+ +--------+--------+
                  |                   |                   |
                  +-------------------+-------------------+
@@ -76,22 +76,22 @@ At the highest level, the system is a stateful workflow engine wrapped around HR
                                      v
                             +--------+---------+
                             | Memory Recall    |
-                            | Chroma incidents |
-                            | local embeddings |
+                            | Qdrant/pgvector  |
+                            | incident memory  |
                             +--------+---------+
                                      |
                                      v
                             +--------+---------+
                             | RL Action Ranker |
                             | Thompson bandit  |
-                            | numpy + npz      |
-                            | SQLite rewards   |
+                            | feature store    |
+                            | policy store     |
                             +--------+---------+
                                      |
                                      v
                             +--------+---------+
                             | Compliance Agent |
-                            | YAML rules       |
+                            | rule registry    |
                             | safe evaluator   |
                             | hard vetoes      |
                             +--------+---------+
@@ -103,7 +103,7 @@ At the highest level, the system is a stateful workflow engine wrapped around HR
               | HITL Gate        |        | Action Agent     |
               | LangGraph        |        | FastAPI tools    |
               | interrupt()      |        | JSON schemas     |
-              | Streamlit/API UI |        | idempotency      |
+              | Reviewer API/UI  |        | idempotency      |
               +--------+---------+        +--------+---------+
                        |                           |
                        +-------------+-------------+
@@ -111,7 +111,7 @@ At the highest level, the system is a stateful workflow engine wrapped around HR
                                      v
                             +--------+---------+
                             | Memory Write     |
-                            | Chroma incident  |
+                            | incident record  |
                             | reward metadata  |
                             +--------+---------+
                                      |
@@ -119,15 +119,15 @@ At the highest level, the system is a stateful workflow engine wrapped around HR
                             +--------+---------+
                             | Reward Update    |
                             | bandit posterior |
-                            | rl_policy.npz    |
-                            | SQLite audit     |
+                            | policy store     |
+                            | reward ledger    |
                             +--------+---------+
                                      |
                                      v
                             +--------+---------+
                             | Observability    |
-                            | JSONL traces     |
-                            | SQLite metrics   |
+                            | OpenTelemetry    |
+                            | metrics/logs     |
                             | cost ledger      |
                             +--------+---------+
                                      |
@@ -137,15 +137,15 @@ At the highest level, the system is a stateful workflow engine wrapped around HR
 
 ### 3.1 End-to-End Lifecycle
 
-1. **Inputs enter through three trigger paths.** Reactive requests come from chat or REST, scheduled scans run over the generated dataset, and system-generated alerts arrive through the mock upstream API. All three paths normalize into a `Signal` containing source, payload, priority, employee IDs when known, and trace identifiers.
+1. **Inputs enter through three trigger paths.** Reactive requests come from web/mobile/API channels, scheduled scans run through durable workflow schedulers, and system-generated alerts arrive through events or webhooks from upstream platforms. All three paths normalize into a `Signal` containing source, payload, tenant ID, priority, employee IDs when known, and trace identifiers.
 
-2. **The graph owns orchestration.** LangGraph receives the `Signal` and loads or creates the matching `GraphState`. The checkpointer persists the state after every node, which is what makes multi-turn conversation, HITL pause/resume, and server restart recovery possible.
+2. **The graph owns orchestration.** LangGraph receives the `Signal` and loads or creates the matching `GraphState`. A Postgres-backed checkpointer persists state after every node, which is what makes multi-turn conversation, HITL pause/resume, worker failover, and restart recovery possible.
 
 3. **The Supervisor routes, but does not solve.** It performs lightweight triage: scheduled and system alerts go to anomaly investigation; reactive requests are classified into policy question, action request, anomaly report, or mixed. The Supervisor writes routing intent to state, and LangGraph conditional edges invoke the next node. No sub-agent calls another sub-agent directly.
 
 4. **Policy grounding and anomaly detection enrich the same state.** The Policy Agent retrieves policy chunks and writes cited answers or policy context. The Anomaly Agent writes detected anomalies, evidence, severity, confidence, and an initial recommended action. If the request is mixed, both outputs can coexist in state before action selection.
 
-5. **Episodic memory adds precedent before action ranking.** The Memory Recall node retrieves similar resolved incidents from Chroma. These incidents are shown to humans and used to warm-start the bandit for this decision, so repeated patterns can be handled faster and with more confidence.
+5. **Episodic memory adds precedent before action ranking.** The Memory Recall node retrieves similar resolved incidents from a managed vector store. These incidents are shown to humans and used to warm-start the bandit for this decision, so repeated patterns can be handled faster and with more confidence.
 
 6. **The RL layer ranks actions.** The contextual bandit receives deterministic features from the anomaly, employee, policy context, and memory signals. It ranks the five allowed actions: `auto-correct`, `escalate-to-manager`, `escalate-to-HR`, `flag-for-audit`, and `no-action`. The top-ranked action becomes the proposed action, not an executed action.
 
@@ -153,24 +153,24 @@ At the highest level, the system is a stateful workflow engine wrapped around HR
 
 8. **HITL handles uncertainty and risk.** If confidence is below the auto-action threshold, risk tier is high, or compliance requires approval, the graph pauses with `interrupt()`. The approval UI/API shows evidence, confidence, policy citations, reasoning, RL ranking, compliance findings, and precedents. The reviewer can approve, reject, or modify. Timeout resumes with `flag-for-audit`.
 
-9. **The Action Agent executes only after approval and compliance.** Tool calls go through typed mock APIs with schema validation, idempotency keys, retries for transient errors, and fallback to audit when execution is unsafe or fails semantically.
+9. **The Action Agent executes only after approval and compliance.** Tool calls go through typed integration adapters with schema validation, idempotency keys, retries for transient errors, circuit breakers, and fallback to audit when execution is unsafe or fails semantically.
 
 10. **Learning closes the loop.** HITL decisions, delayed outcome checks, false-positive labels, and compliance vetoes produce reward events. The bandit posterior is updated and persisted to disk, so later runs measurably change their action rankings.
 
-11. **Resolved incidents become future memory.** The Memory Write node stores the final incident context, action, human decision, outcome, and reward in Chroma. Similar future incidents retrieve this precedent.
+11. **Resolved incidents become future memory.** The Memory Write node stores the final incident context, action, human decision, outcome, and reward in the managed incident-memory index. Similar future incidents retrieve this precedent.
 
-12. **Observability is emitted throughout, not bolted on.** Every node appends a `StateTransition` to shared state: node name, input digest, output summary, latency, tool calls, token usage, cost, selected RL action, and rewards. The same event is written to JSONL and indexed in SQLite for the live trace UI and evaluation harness.
+12. **Observability is emitted throughout, not bolted on.** Every node appends a `StateTransition` to shared state: node name, input digest, output summary, latency, tool calls, token usage, cost, selected RL action, and rewards. The same event is exported through OpenTelemetry and indexed for reviewer UI, incident forensics, evaluation, and cost reporting.
 
 ### 3.2 What Persists Where
 
 | Artifact | Store | Why it exists |
 |---|---|---|
-| Workflow state and HITL checkpoints | LangGraph SQLite checkpointer | Resume paused runs and survive restart |
-| Employee/payroll/leave/training data | SQLite | Queryable simulated HR source of truth |
-| Policy chunks and incident memory | Chroma | RAG retrieval and episodic warm-start |
-| RL policy | `data/rl_policy.npz` plus SQLite reward tables | Persist learned behavior and audit reward history |
-| Trace and cost events | JSONL plus SQLite indexes | Live UI, eval assertions, cost comparison, debugging |
-| Compliance rules | YAML | Auditable hard-veto logic outside prompts |
+| Workflow state and HITL checkpoints | Postgres-backed LangGraph checkpointer | Resume paused runs, support worker failover, and preserve audit history |
+| Employee/payroll/leave/training data | Operational databases, warehouse, and feature store | Queryable HR source of truth and detector inputs |
+| Policy chunks and incident memory | Managed vector store | RAG retrieval and episodic warm-start |
+| RL policy | Policy store plus reward ledger | Persist learned behavior and audit reward history |
+| Trace and cost events | OpenTelemetry, log store, metrics store, cost warehouse | Reviewer UI, SLOs, evaluation, cost reporting, debugging |
+| Compliance rules | Versioned rule registry | Auditable hard-veto logic outside prompts |
 
 ### 3.3 Safety Invariants
 
@@ -209,20 +209,20 @@ The contract surface is intentionally explicit:
 | `BanditDecision` | RL Action Ranker | Compliance/HITL/diagnostics | Store ranked actions and sampled/posterior scores |
 | `ComplianceResult` | Compliance Agent | HITL/Action Agent/RL rewards | Enforce approval requirements and hard vetoes |
 | `ReviewPacket` | HITL Gate | Reviewer UI/API | Present context for approve/reject/modify decisions |
-| `IncidentResolution` | Memory Write | Chroma episodic memory | Store resolved precedent for future warm-start |
+| `IncidentResolution` | Memory Write | Managed episodic memory | Store resolved precedent for future warm-start |
 | `RewardEvent` | HITL/outcome/compliance hooks | RL policy store | Update learned action policy |
 
 Full Python definitions and JSON examples are in [interface-contracts.md](interface-contracts.md).
 
 ## 5. Agents
 
-**Policy Agent:** Retrieves from the HR policy corpus using Chroma. Policies are split by markdown headings and clauses so numeric limits stay with their conditions. The agent returns cited answers only; if retrieved chunks do not support an answer, it says the policy corpus does not cover the question. A cheap verifier checks that claims are entailed by cited chunks.
+**Policy Agent:** Retrieves from the HR policy corpus using a managed vector store. Policies are split by markdown headings and clauses so numeric limits stay with their conditions. The agent returns cited answers only; if retrieved chunks do not support an answer, it says the policy corpus does not cover the question. A verifier checks that claims are entailed by cited chunks.
 
 **Anomaly Detection Agent:** Uses deterministic pandas/numpy detectors, not LLM judgment. Payroll outliers use robust z-scores within peer cohorts such as department, band, and country. Leave abuse uses clustering around weekends/holidays, policy-limit pressure, and threshold-gaming patterns. Compliance violations include missing training, overtime cap breaches, probation constraints, and correction-window issues.
 
 **Compliance Agent:** Evaluates every proposed action against YAML rules before execution. Rules include overtime caps, leave notice periods, probation restrictions, payroll correction tiers, mandatory training gates, retro-correction windows, and double-correction locks. A hard veto blocks the action even if RL, the Supervisor, or a human reviewer preferred it.
 
-**Action Agent:** Executes only compliance-approved actions through mock API tools: payroll adjustment, leave flag, ticket escalation, audit log, and training assignment. Guardrails include JSON-schema validation, idempotency keys, parameter re-checks, retries for transient failures, and dry-run mode for evals.
+**Action Agent:** Executes only compliance-approved actions through production integration adapters: payroll adjustment, leave flag, ticket escalation, audit log, and training enrollment. Guardrails include JSON-schema validation, idempotency keys, parameter re-checks, retries for transient failures, circuit breakers, and sandbox mode for pre-production validation.
 
 **Memory Nodes:** Retrieve and write resolved incidents. Memory is not used as untrusted free text for tools; it biases ranking and helps humans see precedents.
 
@@ -242,13 +242,13 @@ class Anomaly(BaseModel):
     action_candidates: list[ActionCandidate]
 ```
 
-Confidence is calibrated against seeded ground-truth anomalies:
+Confidence is calibrated against historical incident labels, payroll audit outcomes, reviewer decisions, and backtesting datasets:
 
 ```text
-confidence = calibrated_signal_strength * data_quality * corroboration_boost
+confidence = clamp01(calibrated_signal_strength * data_quality * corroboration_boost)
 ```
 
-Signal strength comes from detector-specific statistics, such as robust z-score magnitude or tail probability. Data quality penalizes small cohorts, missing fields, and legitimate context changes. Corroboration increases confidence when independent signals agree, for example payroll delta plus unmatched overtime data.
+`calibrated_signal_strength` and `data_quality` are each in `[0, 1]`. `corroboration_boost` is a bounded multiplier in `[1.0, 1.0 + MAX_BOOST]`, and the final product is clamped to `[0, 1]` so it always honors the `confidence: Field(ge=0, le=1)` contract. Signal strength comes from detector-specific statistics, such as robust z-score magnitude or tail probability. Data quality penalizes small cohorts, missing fields, and legitimate context changes. Corroboration increases confidence when independent signals agree, for example payroll delta plus unmatched overtime data, but the cap prevents corroboration alone from making a weak anomaly look certain.
 
 The five action arms are:
 
@@ -262,7 +262,7 @@ High-confidence, low-risk anomalies can proceed to the Action Agent automaticall
 
 ## 7. Reinforcement Learning Feedback Layer
 
-The RL decision is intentionally narrow: for a given anomaly context, rank the five action arms. This matches a contextual bandit better than PPO/REINFORCE because the assignment demo has only a few feedback cycles, while policy-gradient routing would need far more episodes to show a reliable change.
+The RL decision is intentionally narrow: for a given anomaly context, rank the five action arms. This matches a contextual bandit better than PPO/REINFORCE because production feedback is sparse, delayed, and safety-constrained; policy-gradient routing would need far more exploration than payroll/compliance workflows can safely tolerate.
 
 Algorithm: linear Thompson-sampling contextual bandit.
 
@@ -278,12 +278,12 @@ Reward sources:
 | HITL | timeout | mild penalty, then safe default |
 | Outcome | auto-correct recurs within N cycles | negative delayed reward |
 | Outcome | auto-correct does not recur within N cycles | positive delayed reward |
-| False positive | reviewer or eval labels anomaly as legitimate/data error | negative reward |
+| False positive | reviewer or audit labels anomaly as legitimate/data error | negative reward |
 | Compliance | proposed action receives a hard veto | `-1.0` |
 
-Rewards are summed per decision and clipped to keep a single event from destabilizing the policy. Every posterior update persists to disk: small bandit matrices in `data/rl_policy.npz`, plus auditable `rl_decisions`, `rl_rewards`, and `pending_rewards` tables in SQLite. Restarting the server reloads the learned policy; it does not reset behavior.
+Rewards are summed per decision and clipped to keep a single event from destabilizing the policy. Every posterior update is persisted to the policy store and mirrored into an auditable reward ledger. Worker restarts reload the learned policy; they do not reset behavior.
 
-This is a real learning signal, not prompt stuffing. Human decisions and outcomes update numerical posteriors that change future action rankings. The Loom/demo compares action distribution before and after at least two simulated feedback cycles.
+This is a real learning signal, not prompt stuffing. Human decisions and outcomes update numerical posteriors that change future action rankings. Production dashboards compare action distribution, approval rate, veto rate, false-positive rate, and reward curves across time windows and tenants.
 
 ## 8. HITL, Compliance, and Memory
 
@@ -299,39 +299,42 @@ The HITL packet contains anomaly evidence, proposed action, confidence score, ag
 
 Compliance vetoes are final. If the top-ranked action is vetoed, the veto is logged as a negative reward and the next non-vetoed ranked action is checked. `flag-for-audit` is the guaranteed safe fallback.
 
-Resolved incidents are embedded into Chroma with context, action, outcome, reward, and metadata. On a similar future anomaly, memory applies weighted pseudo-observations to a cloned bandit posterior for that decision. This warm-starts ranking without permanently contaminating the global policy from one precedent. A confirmed similar incident also contributes a capped precedent term to `corroboration_boost`, so the second occurrence can score higher confidence without memory alone making a weak anomaly look certain. The demo shows the second occurrence of a similar anomaly receiving higher confidence, fewer graph hops, and either a faster HITL decision or no HITL when safe.
+Resolved incidents are embedded into the incident memory collection with context, action, outcome, reward, and metadata. On a similar future anomaly, memory applies weighted pseudo-observations to a cloned bandit posterior for that decision. This warm-starts ranking without permanently contaminating the global policy from one precedent. A confirmed similar incident also contributes a capped precedent term to `corroboration_boost`, so repeat patterns can score higher confidence without memory alone making a weak anomaly look certain. The production KPI is reduced reviewer handling time and improved approval precision on recurring incident families.
 
-## 9. Data, RAG, and Mock APIs
+## 9. Data, RAG, and Integration APIs
 
-Seeded generators create:
+Production data inputs:
 
-- 500-1,000 employees across departments, bands, countries, tenure buckets, managers, and probation states.
-- Six months of payroll, attendance, leave, performance, and training records.
-- Injected payroll, leave, and compliance anomalies with hidden ground-truth labels for calibration and evals.
-- HR policies in Markdown/PDF covering leave, payroll corrections, overtime/attendance, and training/compliance.
-- FastAPI mock services with OpenAPI schemas for payroll lookup/adjustment, attendance lookup, leave flagging, tickets, alerts, and audit logging.
+- HRIS employee master data across tenants, departments, bands, countries, managers, and lifecycle states.
+- Payroll, attendance, leave, performance, and training records from operational stores and warehouse tables.
+- Historical incidents, payroll audits, reviewer decisions, compliance vetoes, and outcome labels for calibration and evaluation.
+- HR policies from versioned document repositories, legal policy systems, and jurisdiction-specific rule registries.
+- Integration APIs with explicit OpenAPI/JSON schemas for payroll lookup/adjustment, attendance lookup, leave flagging, ticketing, alerts, and audit logging.
 
-Consistency checks make the artifacts defensible: payroll arithmetic balances, leave balances never go negative, attendance and leave do not overlap, and policy thresholds match both the YAML compliance rules and injected anomaly generator.
+Data-quality checks run before signals reach the graph: payroll arithmetic must balance, leave balances cannot go negative, attendance and leave cannot overlap, policy thresholds must match rule-registry thresholds, tenant IDs must remain isolated, and PII fields must be redacted from prompts and traces unless explicitly needed.
 
 ## 10. Observability, Evaluation, and Cost
 
-Observability is structural, not optional. The `@node` wrapper around every graph node records step latency, tool calls, retries, token usage, cost, cache hits, selected RL action, sampled scores, reward events, and output summaries. JSONL traces support inspection per workflow run, while SQLite tables power a Streamlit live trace view.
+Observability is structural, not optional. The `@node` wrapper around every graph node records step latency, tool calls, retries, token usage, cost, cache hits, selected RL action, sampled scores, reward events, and output summaries. Trace events are exported through OpenTelemetry and correlated with tenant, run, workflow, and reviewer identifiers.
 
-The evaluation harness contains 15 declarative cases:
+Evaluation has three layers:
 
-- Happy paths: grounded policy answer, reactive payslip investigation, scheduled scan across all anomaly classes, safe high-confidence action.
-- Edge cases: small cohorts, mock API failures, HITL timeout, high confidence plus approval-required action.
-- Adversarial cases: prompt injection, unsupported policy question, nonexistent employee.
-- RL cases: manager rejects auto-corrections, approve-heavy reviewer, compliance-veto learning, memory warm-start on a repeat anomaly.
+- **Offline regression suite:** deterministic fixtures for policy grounding, anomaly scoring, compliance rules, tool-schema validation, prompt-injection resistance, and reward calculations.
+- **Backtesting:** replay historical incidents and audits to measure precision, recall, calibration, action distribution, veto rate, and reviewer agreement before policy promotion.
+- **Online monitoring:** canary releases, tenant-level drift detection, false-positive sampling, reward-hacking checks, and SLO dashboards for latency, approval backlog, and incident resolution time.
 
-RL diagnostics render cumulative reward and action distribution shift across feedback cycles. These plots are the proof that the feedback layer changes proposals over time.
+RL diagnostics render cumulative reward, action distribution shift, per-arm posterior trends, approval rate, veto rate, and false-positive rate across time windows. Policy promotion requires offline backtest thresholds and online guardrail checks.
 
-Cost tracking is centralized in one LLM client. Two modes run through the same eval harness:
+Cost tracking is centralized in one LLM client. Production cost controls include:
 
-- `naive`: all possible language work uses the strongest model tier, no prompt caching, no deterministic short-circuits.
-- `optimized`: deterministic anomaly/compliance logic, small model for closed-set routing, mid-tier model for RAG synthesis, strongest model only for high-judgment narratives, prompt caching for static instructions/tool schemas, and narration only for user-visible or HITL cases.
+- deterministic anomaly/compliance logic that avoids unnecessary LLM calls;
+- small models for closed-set routing and verification;
+- stronger models only for high-judgment narratives;
+- prompt caching for static instructions and schemas;
+- retrieval-bounded prompts;
+- tenant-level budgets, alerts, and rate limits.
 
-The required >=20% reduction is reported from measured eval output, not estimated in prose.
+Cost dashboards report spend per tenant, workflow type, node, model tier, and policy version.
 
 ## 11. Repository Shape
 
@@ -345,160 +348,168 @@ src/selfheal/
   hitl/           # approval API, interrupt/resume, timeout sweeper
   compliance/     # rules.yaml and rules engine
   rag/            # chunking, indexing, retrieval, verifier
-  tools/          # mock tool clients and schemas
-  mocks/          # FastAPI upstream services
+  tools/          # integration adapters and schemas
+  integrations/   # payroll, attendance, leave, ticketing, audit clients
   obs/            # traces, costs, structured logging
-ui/               # Streamlit ops console and approvals
-scripts/          # seed data, build index, run demo cycles, diagnostics
-evals/            # 15-case harness and reviewer personas
-data/             # SQLite, checkpoints, Chroma, traces, learned RL policy
-docs/             # assignment PDF only
+ui/               # reviewer console and operations views
+jobs/             # scheduled scans, replays, diagnostics, policy promotion
+tests/            # unit, integration, backtest, safety regression suites
+infra/            # deployment manifests, dashboards, alerts, runbooks
+docs/             # source PDF only
+README.md
+architecture.md
 interface-contracts.md
 llm-instructions.md
 ```
 
 ## 12. Technology Tradeoffs and Rationale
 
-The main design bias is: use boring, inspectable infrastructure for the demo, and spend complexity only where the assignment explicitly evaluates it - stateful agent orchestration, grounded RAG, HITL, compliance vetoes, episodic memory, and a real RL feedback loop.
+The main design bias is: use auditable, horizontally scalable infrastructure for workflow state, tenant data, policy retrieval, human approvals, and learning. The platform should fail closed around payroll and compliance, expose every decision to audit, and allow model or policy changes only through evaluation gates.
 
-### 12.1 Agent Orchestration: LangGraph
-
-| Option | Pros | Cons |
-|---|---|---|
-| LangGraph `StateGraph` | Native shared state, conditional routing, checkpointing, interrupt/resume support, and a clean way to prove "no direct agent-to-agent calls" | Extra dependency; API surface is more complex than a simple loop |
-| Hand-rolled state machine | Maximum control, fewer dependencies, easy to debug for a tiny prototype | We would need to rebuild checkpointing, HITL pause/resume, transition logging, and graph replay - exactly the features being evaluated |
-| CrewAI/AutoGen | Fast conversational agent demos | These frameworks naturally encourage agent-to-agent conversations, which conflicts with the assignment's hard state-graph requirement |
-
-**Decision:** use LangGraph. It maps directly to the required architecture: Supervisor routes, sub-agents write to shared state, all transitions are logged, and HITL can pause without blocking a process thread.
-
-**Accepted tradeoff:** some graph boilerplate. This is worth it because the boilerplate is visible proof of the architecture constraint rather than hidden framework magic.
-
-### 12.2 LLM Integration: Thin Provider Client, Not Full LangChain
+### 12.1 Workflow Orchestration: LangGraph State Machine plus Durable Runtime
 
 | Option | Pros | Cons |
 |---|---|---|
-| Raw provider SDK behind `llm/client.py` | Full control over structured outputs, token usage, cache policy, model tiering, and cost accounting | We write small wrappers for retries, parsing, and tracing |
-| LangChain chains everywhere | Lots of ready-made abstractions for prompts, retrievers, and chains | Harder to keep exact token accounting and cache behavior; can obscure which call made which decision |
-| Provider-agnostic abstraction from day one | Easier future vendor swap | Adds indirection before the product requirements are stable |
+| LangGraph `StateGraph` with Postgres checkpointer | Clear shared-state graph, conditional routing, interrupt/resume, replayable state transitions, and strong separation between agents | Requires careful versioning of state schemas and graph migrations |
+| Temporal-only workflow | Excellent durability, retries, timers, and operational controls | Less natural for LLM/RAG state transitions and agent graph inspection |
+| Hand-rolled state machine | Maximum control | Rebuilds checkpointing, replay, HITL pause/resume, schema evolution, and transition tracing |
+| CrewAI/AutoGen-style orchestration | Quick multi-agent conversations | Harder to enforce strict shared-state boundaries and deterministic compliance gates |
 
-**Decision:** use a thin LLM client module. Machine-consumed outputs are structured with schemas, every call is costed centrally, and deterministic nodes avoid LLM calls entirely.
+**Decision:** use LangGraph for the agent state graph and back it with durable Postgres checkpoints. For long-running schedules, retries, and operational timers, wrap graph execution in a durable worker runtime such as Temporal or an equivalent internal workflow platform.
 
-**Accepted tradeoff:** mild provider coupling. The code isolates that coupling in one module, which is enough for the assignment and keeps cost optimization measurable.
+**Accepted tradeoff:** two layers of orchestration. LangGraph owns semantic state transitions; the durable runtime owns retries, timers, queues, and worker lifecycle.
+
+### 12.2 LLM Integration: Governed Gateway and Thin Client
+
+| Option | Pros | Cons |
+|---|---|---|
+| Internal LLM gateway plus thin service client | Centralized budgets, model routing, prompt versioning, PII controls, retries, usage accounting, and audit logs | Gateway becomes a critical dependency and needs SLOs |
+| Direct provider SDK in every agent | Maximum feature access and low initial complexity | Scattered cost accounting, uneven retry behavior, harder policy enforcement |
+| Heavy chain framework across all nodes | Many prebuilt abstractions | Can obscure token/cost attribution and make deterministic governance harder |
+
+**Decision:** route all LLM calls through a governed gateway and expose a thin typed client to graph nodes. Machine-consumed outputs must use schemas; deterministic nodes avoid LLM calls entirely.
+
+**Accepted tradeoff:** slower adoption of provider-specific features. The upside is consistent safety, cost attribution, prompt rollout, and tenant-level controls.
 
 ### 12.3 RL Algorithm: Contextual Bandit
 
 | Option | Pros | Cons |
 |---|---|---|
 | Linear Thompson-sampling contextual bandit | Sample-efficient, interpretable, easy to persist, and directly learns which of the 5 actions to rank first | Only learns a one-step action decision, not full long-horizon workflow strategy |
-| LinUCB | Also sample-efficient and interpretable | Requires exploration tuning; warm-starting from episodic memory is less natural |
-| PPO/REINFORCE on Supervisor routing | More general sequential learning story | Needs far more episodes; demo changes after 2 cycles would likely be noisy or artificial |
-| Prompt-only feedback memory | Very simple | Not a real learning signal and explicitly would not satisfy the assignment |
+| LinUCB | Also sample-efficient and interpretable | Requires explicit exploration tuning; less natural for memory-based pseudo-observations |
+| PPO/REINFORCE on Supervisor routing | More general sequential optimization | Requires exploration that is difficult to justify in payroll/compliance workflows; harder to audit |
+| Learned reward model | Can capture nuanced human preferences | Adds model-risk, drift monitoring, and explainability burden |
+| Prompt-only feedback memory | Simple to ship | Does not provide a measurable or auditable learning signal |
 
-**Decision:** use Thompson sampling over deterministic context features. The action space is small, rewards are clear, and the Loom can show posterior movement plus action-distribution shift after two feedback cycles.
+**Decision:** use Thompson sampling over deterministic context features. The action space is small, rewards are available from human decisions and outcomes, and posterior movement is easy to audit.
 
-**Accepted tradeoff:** it optimizes action recommendations, not the whole graph policy. That is intentional: routing is mostly deterministic from trigger type, while action choice has meaningful human feedback.
+**Accepted tradeoff:** it optimizes action recommendations, not the whole graph policy. That is intentional: routing should remain explainable and rule-bounded, while action ranking can safely learn under compliance and HITL gates.
 
 ### 12.4 Anomaly Detection: Deterministic Statistics Before LLMs
 
 | Option | Pros | Cons |
 |---|---|---|
-| Pandas/numpy detectors with calibration | Reproducible, auditable, cheap, and easy to validate against seeded ground truth | Detects known anomaly classes rather than inventing new ones |
+| SQL/Spark/Python statistical detectors with calibration | Reproducible, auditable, cost-efficient, and easy to validate against historical outcomes | Detects defined anomaly families better than unknown unknowns |
 | LLM-based anomaly scoring | Flexible and easy to explain in natural language | Non-deterministic, hard to calibrate, expensive for scans, and risky for payroll/compliance claims |
-| Unsupervised ML models such as Isolation Forest | Can find unfamiliar outliers | Harder to explain to HR reviewers; still needs calibration and per-cohort tuning |
+| Unsupervised ML models such as Isolation Forest | Can surface unfamiliar outliers | Harder to explain to HR reviewers; needs per-tenant calibration and drift controls |
+| Fully supervised classifiers | Strong performance when labels are rich | Labels are sparse, tenant-specific, and delayed; retraining governance is heavier |
 
 **Decision:** use deterministic detectors for payroll, leave, and compliance anomalies. The LLM can narrate evidence for humans, but it does not decide that a payroll anomaly exists.
 
-**Accepted tradeoff:** less open-ended discovery. For production, an unsupervised "suggestion only" detector could feed `flag-for-audit`, but automatic action should stay grounded in explainable signals.
+**Accepted tradeoff:** less open-ended discovery. Unsupervised detectors can feed low-risk audit queues, but automatic or semi-automatic action stays grounded in explainable signals.
 
-### 12.5 Persistence: SQLite plus Files
-
-| Option | Pros | Cons |
-|---|---|---|
-| SQLite, JSONL, and `rl_policy.npz` | Zero ops, inspectable, transactional enough for local demo, survives restarts, easy for reviewers to query | Not ideal for multi-process or high-concurrency production workloads |
-| Postgres | Strong concurrency, operational familiarity, natural production fit | Adds setup friction for the assignment and makes the local demo heavier |
-| In-memory state | Fastest to prototype | Fails the persistence requirement for RL and HITL |
-
-**Decision:** use SQLite for application state, approval queues, reward audit trails, cost ledger, and LangGraph checkpoints; use `rl_policy.npz` for compact bandit matrices.
-
-**Accepted tradeoff:** single-process bias. This is fine for the assignment because persistence and inspectability matter more than horizontal scale.
-
-### 12.6 Vector Store and Embeddings: Chroma plus Local Embeddings
+### 12.5 Persistence: Postgres, Warehouse, Object Store, and Policy Store
 
 | Option | Pros | Cons |
 |---|---|---|
-| Chroma embedded store | Local, persistent, no service dependency, good enough for small policy and incident corpora | Weaker filtering and scaling story than dedicated vector databases |
-| Qdrant | Better production vector database with stronger filtering and indexing | Requires running and configuring another service |
-| pgvector | Keeps vectors and relational metadata together | Needs Postgres and more setup |
-| Hosted embeddings | Strong quality on broad corpora | API cost, network dependency, and less deterministic local evaluation |
-| Local sentence-transformer embeddings | Free, reproducible, offline, fast for small corpora | Lower quality than top hosted embedding models on long or messy text |
+| Postgres for workflow/checkpoints/approvals | Strong transactional semantics, mature operations, row-level tenancy controls | Needs careful partitioning and retention policy at large scale |
+| Warehouse/lakehouse for analytical history | Efficient backtests, drift analysis, and long retention | Not suitable for low-latency workflow mutation |
+| Object store for artifacts and model/policy snapshots | Durable, cheap, versioned storage | Requires metadata indexing elsewhere |
+| In-memory state | Low latency | Not acceptable for HITL, audit, or learned policy persistence |
 
-**Decision:** use Chroma with local embeddings for both policy RAG and episodic memory. The corpus is intentionally small: 3-5 pages of policy plus resolved incidents.
+**Decision:** use Postgres for graph checkpoints, approvals, reward ledger, and operational metadata; warehouse tables for historical analysis; object storage for versioned policy snapshots and large artifacts.
 
-**Accepted tradeoff:** not the final production vector architecture. At scale, this becomes Qdrant or pgvector with tenant namespaces, PII controls, and lifecycle policies.
+**Accepted tradeoff:** more infrastructure than a single database. The separation keeps latency-sensitive workflow state distinct from analytical backtesting and long-term retention.
 
-### 12.7 API and Reviewer UI: FastAPI plus Streamlit
-
-| Option | Pros | Cons |
-|---|---|---|
-| FastAPI | Typed request/response models, async support, automatic OpenAPI spec, good mock-tool ergonomics | More structure than a tiny Flask app |
-| Flask | Very small and familiar | Less schema-first by default; more manual OpenAPI work |
-| Django | Batteries included | Too heavy for a prototype mock API and agent service |
-| Streamlit | Fast Python-only reviewer UI, good for showing traces and HITL packets in a demo | Less polished and less customizable than a real React product UI |
-| React | Production-grade UI flexibility | Slower to build; adds a separate frontend stack not central to the assignment |
-
-**Decision:** FastAPI for mock upstream APIs, action tools, alert intake, and approval endpoints; Streamlit for the ops console and approval queue.
-
-**Accepted tradeoff:** the UI is demo-grade. The APIs are still clean enough that a production React console can replace Streamlit later.
-
-### 12.8 Scheduling and Feedback Cycles: APScheduler plus Logical Cycles
+### 12.6 Vector Store and Embeddings: Managed Vector Search
 
 | Option | Pros | Cons |
 |---|---|---|
-| APScheduler | Simple in-process cron, no broker, easy demo setup | Not a distributed scheduler |
-| Celery or RQ | Durable background jobs and retries | Requires broker/worker setup; heavier than needed |
-| System cron | Simple operational model | Harder to coordinate with app state and demo cycle controls |
-| Logical cycle counter | Deterministic evals and fast two-cycle RL demo | Less realistic than waiting on wall-clock time |
+| Qdrant or managed vector DB | Strong filtering, tenant namespaces, operational scaling, and vector-specific indexing | Additional service to operate and secure |
+| pgvector | Keeps vectors close to relational metadata and tenant controls | Can be harder to scale independently for large vector workloads |
+| Search engine hybrid retrieval | Strong lexical plus semantic search | More complex ranking and index management |
+| Local embedded vector store | Simple | Not appropriate for multi-tenant production scale |
+| Hosted embeddings | Strong quality and operational simplicity | Cost, vendor dependency, and PII routing requirements |
+| Self-hosted embeddings | Data residency and cost control | Requires model serving and quality monitoring |
 
-**Decision:** APScheduler handles real scheduled jobs and timeout sweeps, while the demo/eval uses a logical `cycle` integer for recurrence windows and feedback comparisons.
+**Decision:** use a managed vector store with tenant namespaces and metadata filters. Choose hosted or self-hosted embeddings based on data residency, latency, and cost constraints per deployment region.
 
-**Accepted tradeoff:** simulated time is less production-real, but it makes before/after RL behavior reproducible and easy to grade.
+**Accepted tradeoff:** more operational surface. The benefit is reliable retrieval, policy isolation, and incident-memory scale across tenants and jurisdictions.
 
-### 12.9 Compliance Engine: YAML Rules plus Safe Expression Evaluation
+### 12.7 API and Reviewer UI: FastAPI Services plus Product Console
 
 | Option | Pros | Cons |
 |---|---|---|
-| YAML/JSON rules with a small evaluator | Auditable, editable without prompt changes, versionable, and directly satisfies the assignment | Less expressive than arbitrary code |
+| FastAPI services | Typed contracts, async support, OpenAPI schemas, straightforward integration testing | Requires separate auth, rate-limit, and deployment patterns |
+| Existing internal service framework | Consistent with platform standards | May slow iteration if framework is heavy |
+| React/product console | Best reviewer workflow, permissions, accessibility, and audit UI | Requires frontend delivery and design investment |
+| Admin-only lightweight UI | Faster to build | Not sufficient for high-volume reviewer operations |
+
+**Decision:** expose graph ingress, approvals, tool callbacks, and diagnostics through FastAPI-compatible services with strict OpenAPI contracts. Build the reviewer experience into the product console with role-based access, queue management, and audit views.
+
+**Accepted tradeoff:** more product work up front. HITL is the primary feedback loop, so reviewer ergonomics and permissions are production requirements, not optional polish.
+
+### 12.8 Scheduling and Eventing: Durable Workflows and Event Bus
+
+| Option | Pros | Cons |
+|---|---|---|
+| Temporal schedules/workflows | Durable timers, retries, visibility, and long-running workflow support | Operational dependency and workflow modeling overhead |
+| Airflow/Dagster | Strong batch orchestration and data dependencies | Less ideal for per-incident pause/resume and HITL |
+| Kafka/SQS event bus | Scalable event ingestion and tenant partitioning | Requires idempotency and consumer-lag operations |
+| In-process scheduler | Simple | Not reliable for production failover or horizontal workers |
+
+**Decision:** use an event bus for upstream alerts and durable workflow scheduling for scans, HITL timeouts, delayed outcome checks, and reward resolution.
+
+**Accepted tradeoff:** operational complexity. This is required because missed scans, stuck approvals, or lost delayed rewards directly affect payroll and compliance outcomes.
+
+### 12.9 Compliance Engine: Versioned Rule Registry
+
+| Option | Pros | Cons |
+|---|---|---|
+| Versioned YAML/JSON decision tables with safe evaluator | Auditable, reviewable by compliance teams, diffable, testable, and deterministic | Less expressive than arbitrary code |
 | Python rule functions | Maximum flexibility and testability | Rules become code, not configuration; harder for HR/legal stakeholders to review |
 | LLM-as-compliance-judge | Easy to add natural-language nuance | Unsafe for hard vetoes; non-deterministic and hard to audit |
-| Business rules engine | Mature rule management | Adds operational complexity for a small ruleset |
+| Business rules platform | Mature governance and non-engineer workflows | Adds vendor/platform complexity and integration overhead |
 
-**Decision:** use 10-15 YAML rules evaluated by a constrained expression engine over `{employee, anomaly, action}`. All matching rules are logged; any hard veto blocks execution.
+**Decision:** use a versioned rule registry with deterministic evaluation over `{tenant, jurisdiction, employee, anomaly, action}`. All matching rules are logged; any hard veto blocks execution.
 
-**Accepted tradeoff:** rules are intentionally simple. This is a good thing for compliance: hard vetoes should be predictable, tested, and boring.
+**Accepted tradeoff:** rules are intentionally constrained. This is a good thing for compliance: hard vetoes should be predictable, tested, approved, and boring.
 
-### 12.10 Observability: JSONL, SQLite Metrics, and Optional UI
+### 12.10 Observability: OpenTelemetry, Metrics, Audit Ledger
 
 | Option | Pros | Cons |
 |---|---|---|
-| JSONL traces plus SQLite indexes | Easy to inspect, diff, test, and show in a demo | Not a full distributed tracing stack |
-| OpenTelemetry from day one | Production-grade trace correlation | More setup and viewer infrastructure than the assignment needs |
-| Console logs only | Minimal effort | Hard to power eval assertions, cost reports, and live trace UI |
+| OpenTelemetry traces plus metrics/logs | Standard correlation across services, tenants, tools, and LLM calls | Requires sampling, retention, and PII controls |
+| Audit ledger | Immutable record for compliance, reviewer decisions, vetoes, and tool side effects | Adds storage and query design requirements |
+| Console logs only | Simple | Insufficient for incident review, SLOs, cost governance, and audits |
 
-**Decision:** every node emits structured trace events to JSONL and SQLite. This supports the assignment's required trace fields, eval assertions, cost accounting, and live reasoning trace.
+**Decision:** every node emits structured trace events through OpenTelemetry, with immutable audit events for approvals, vetoes, rewards, and side effects.
 
-**Accepted tradeoff:** local observability only. In production, the same event shape can be exported through OpenTelemetry.
+**Accepted tradeoff:** more metadata discipline. The benefit is end-to-end traceability across graph state, human decisions, model calls, and downstream systems.
 
-## 13. Production Path
+## 13. Production Operating Model
 
-For 3M employees and 750 clients, the design scales by replacing local infrastructure without changing the learning loop:
+Production readiness depends on reliability, governance, and tenant isolation as much as model quality.
 
-| Area | Demo | Production |
-|---|---|---|
-| Signals | In-process scheduler and FastAPI | Kafka/SQS or event bus with tenant partitioning |
-| Workflow | LangGraph plus SQLite checkpointer | Durable workflow runtime such as LangGraph Platform or Temporal |
-| Data | SQLite and pandas scans | Warehouse/Spark/Flink incremental detectors with drift monitors |
-| RL | Global bandit policy | Hierarchical tenant policy: global prior plus tenant posterior, with off-policy evaluation |
-| Memory | Embedded Chroma | Qdrant/pgvector with tenant namespaces, TTL, and PII controls |
-| HITL | Streamlit and REST | SLA-aware reviewer queue, role-based approvals, four-eyes controls |
-| Compliance | YAML rules | Versioned jurisdiction rule registry with legal review and rule tests |
-| LLM ops | Static tier config | Gateway with budgets, rate limits, prompt release evals, and per-tenant cost controls |
+| Area | Production control |
+|---|---|
+| Signals | Event bus partitioned by tenant, idempotency keys, replay support, dead-letter queues |
+| Workflow | Durable graph checkpoints, run versioning, pause/resume, timeout recovery, migration plan |
+| Data | Tenant-isolated access, warehouse backtests, feature-store lineage, drift monitors |
+| RL | Hierarchical policy: global prior plus tenant posterior, off-policy evaluation before promotion |
+| Memory | Tenant namespaces, PII minimization, retention policies, deletion workflows |
+| HITL | SLA-aware reviewer queues, role-based approvals, four-eyes controls, escalation paths |
+| Compliance | Versioned jurisdiction rule registry, legal review, unit tests, release approvals |
+| LLM ops | Gateway budgets, rate limits, prompt release gates, data residency controls |
+| Security | RBAC/ABAC, encryption, secrets management, audit exports, incident response runbooks |
+| Reliability | SLOs for scan latency, approval backlog, action execution, and incident resolution |
