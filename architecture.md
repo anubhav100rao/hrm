@@ -6,6 +6,11 @@ This design targets the Darwinbox advanced assignment: an agentic HR operations 
 
 The implementation is a single Python 3.11+ repo with generated mock artifacts: 500-1,000 employees, 3-5 pages of HR policy documents, seeded payroll/attendance/leave/performance data, and a FastAPI mock API spec. The architecture is local-first for the demo, but each storage and orchestration choice has a clear production replacement.
 
+Companion contract docs:
+
+- `docs/interface-contracts.md` defines the Pydantic interfaces and example payloads for signals, RAG chunks, anomalies, RL decisions, HITL packets, incidents, resolutions, rewards, tools, and graph state.
+- `docs/llm-instructions.md` defines the LLM instruction contracts and structured outputs for Supervisor triage, RAG synthesis, verification, reviewer narrative, and final user response.
+
 ## 2. Requirement Mapping
 
 | Requirement | Design choice |
@@ -23,47 +28,158 @@ The implementation is a single Python 3.11+ repo with generated mock artifacts: 
 
 ## 3. High-Level Flow
 
+At the highest level, the system is a stateful workflow engine wrapped around HR-specific agents. Every input, whether it is a chat request, scheduled scan, or upstream alert, becomes the same internal object: a `Signal`. From that point onward, the source no longer matters; the graph treats every workflow as a sequence of state transitions over the same `GraphState`.
+
 ```text
-Reactive request       Scheduled scan       System alert
-      |                    |                    |
-      +--------- normalize into Signal --------+
-                           |
-                           v
-                    LangGraph StateGraph
-                           |
-                    +------+------+
-                    | Supervisor |
-                    +------+------+
-                           |
-        +------------------+------------------+
-        |                  |                  |
-        v                  v                  v
-  Policy Agent      Anomaly Agent       Compliance Agent
-     (RAG)          (stats/rules)        (YAML veto)
-        |                  |                  |
-        +------------------+------------------+
-                           |
-                    Memory Recall
-                           |
-                    RL Action Ranker
-                           |
-                    Compliance Check
-                           |
-          +----------------+----------------+
-          |                                 |
-          v                                 v
-   HITL Gate if needed              Action Agent if safe
-          |                                 |
-          +---------------+-----------------+
-                          |
-                   Memory Write
-                          |
-                   Reward Update
-                          |
-                Trace, metrics, response
+                                  +-----------------------------+
+                                  | Generated artifacts         |
+                                  | SQLite: HR data             |
+                                  | Markdown/PDF: policies      |
+                                  | YAML: compliance rules      |
+                                  +--------------+--------------+
+                                                 |
+                                                 v
++----------------------+  +----------------------+  +----------------------+
+| Reactive request     |  | Scheduled scan       |  | System alert         |
+| Streamlit chat       |  | APScheduler          |  | FastAPI webhook      |
+| FastAPI REST         |  | logical demo cycles  |  | mock upstream API    |
++----------+-----------+  +----------+-----------+  +----------+-----------+
+           |                         |                         |
+           +------------ normalize into typed Signal -----------+
+                                     |
+                                     v
+                            +--------+---------+
+                            | LangGraph        |
+                            | StateGraph       |
+                            | SQLite checkpoint|
+                            +--------+---------+
+                                     |
+                                     v
+                            +--------+---------+
+                            | Supervisor       |
+                            | structured LLM   |
+                            | routing output   |
+                            +--------+---------+
+                                     |
+                 +-------------------+-------------------+
+                 |                   |                   |
+                 v                   v                   v
+        +--------+--------+ +--------+--------+ +--------+--------+
+        | Policy Agent    | | Anomaly Agent   | | Action request  |
+        | RAG             | | pandas/numpy    | | Pydantic schema |
+        | Chroma policies | | robust scoring  | | validation      |
+        | local embeddings| | calibrated conf | | tool params     |
+        +--------+--------+ +--------+--------+ +--------+--------+
+                 |                   |                   |
+                 +-------------------+-------------------+
+                                     |
+                                     v
+                            +--------+---------+
+                            | Memory Recall    |
+                            | Chroma incidents |
+                            | local embeddings |
+                            +--------+---------+
+                                     |
+                                     v
+                            +--------+---------+
+                            | RL Action Ranker |
+                            | Thompson bandit  |
+                            | numpy + npz      |
+                            | SQLite rewards   |
+                            +--------+---------+
+                                     |
+                                     v
+                            +--------+---------+
+                            | Compliance Agent |
+                            | YAML rules       |
+                            | safe evaluator   |
+                            | hard vetoes      |
+                            +--------+---------+
+                                     |
+                       +-------------+-------------+
+                       |                           |
+                       v                           v
+              +--------+---------+        +--------+---------+
+              | HITL Gate        |        | Action Agent     |
+              | LangGraph        |        | FastAPI tools    |
+              | interrupt()      |        | JSON schemas     |
+              | Streamlit/API UI |        | idempotency      |
+              +--------+---------+        +--------+---------+
+                       |                           |
+                       +-------------+-------------+
+                                     |
+                                     v
+                            +--------+---------+
+                            | Memory Write     |
+                            | Chroma incident  |
+                            | reward metadata  |
+                            +--------+---------+
+                                     |
+                                     v
+                            +--------+---------+
+                            | Reward Update    |
+                            | bandit posterior |
+                            | rl_policy.npz    |
+                            | SQLite audit     |
+                            +--------+---------+
+                                     |
+                                     v
+                            +--------+---------+
+                            | Observability    |
+                            | JSONL traces     |
+                            | SQLite metrics   |
+                            | cost ledger      |
+                            +--------+---------+
+                                     |
+                                     v
+                         Final response / tool result / queue item
 ```
 
-All graph nodes append a `StateTransition` to shared state: node name, input digest, output summary, latency, tool calls, token usage, cost, selected RL action, and rewards. The same event is written to JSONL and indexed in SQLite for the live trace UI.
+### 3.1 End-to-End Lifecycle
+
+1. **Inputs enter through three trigger paths.** Reactive requests come from chat or REST, scheduled scans run over the generated dataset, and system-generated alerts arrive through the mock upstream API. All three paths normalize into a `Signal` containing source, payload, priority, employee IDs when known, and trace identifiers.
+
+2. **The graph owns orchestration.** LangGraph receives the `Signal` and loads or creates the matching `GraphState`. The checkpointer persists the state after every node, which is what makes multi-turn conversation, HITL pause/resume, and server restart recovery possible.
+
+3. **The Supervisor routes, but does not solve.** It performs lightweight triage: scheduled and system alerts go to anomaly investigation; reactive requests are classified into policy question, action request, anomaly report, or mixed. The Supervisor writes routing intent to state, and LangGraph conditional edges invoke the next node. No sub-agent calls another sub-agent directly.
+
+4. **Policy grounding and anomaly detection enrich the same state.** The Policy Agent retrieves policy chunks and writes cited answers or policy context. The Anomaly Agent writes detected anomalies, evidence, severity, confidence, and an initial recommended action. If the request is mixed, both outputs can coexist in state before action selection.
+
+5. **Episodic memory adds precedent before action ranking.** The Memory Recall node retrieves similar resolved incidents from Chroma. These incidents are shown to humans and used to warm-start the bandit for this decision, so repeated patterns can be handled faster and with more confidence.
+
+6. **The RL layer ranks actions.** The contextual bandit receives deterministic features from the anomaly, employee, policy context, and memory signals. It ranks the five allowed actions: `auto-correct`, `escalate-to-manager`, `escalate-to-HR`, `flag-for-audit`, and `no-action`. The top-ranked action becomes the proposed action, not an executed action.
+
+7. **Compliance is the hard safety boundary.** The Compliance Agent evaluates the proposed action against YAML rules. A hard veto blocks execution, emits a negative reward to the bandit, and causes the graph to try the next safe ranked action. Human approval cannot override a hard veto.
+
+8. **HITL handles uncertainty and risk.** If confidence is below the auto-action threshold, risk tier is high, or compliance requires approval, the graph pauses with `interrupt()`. The approval UI/API shows evidence, confidence, policy citations, reasoning, RL ranking, compliance findings, and precedents. The reviewer can approve, reject, or modify. Timeout resumes with `flag-for-audit`.
+
+9. **The Action Agent executes only after approval and compliance.** Tool calls go through typed mock APIs with schema validation, idempotency keys, retries for transient errors, and fallback to audit when execution is unsafe or fails semantically.
+
+10. **Learning closes the loop.** HITL decisions, delayed outcome checks, false-positive labels, and compliance vetoes produce reward events. The bandit posterior is updated and persisted to disk, so later runs measurably change their action rankings.
+
+11. **Resolved incidents become future memory.** The Memory Write node stores the final incident context, action, human decision, outcome, and reward in Chroma. Similar future incidents retrieve this precedent.
+
+12. **Observability is emitted throughout, not bolted on.** Every node appends a `StateTransition` to shared state: node name, input digest, output summary, latency, tool calls, token usage, cost, selected RL action, and rewards. The same event is written to JSONL and indexed in SQLite for the live trace UI and evaluation harness.
+
+### 3.2 What Persists Where
+
+| Artifact | Store | Why it exists |
+|---|---|---|
+| Workflow state and HITL checkpoints | LangGraph SQLite checkpointer | Resume paused runs and survive restart |
+| Employee/payroll/leave/training data | SQLite | Queryable simulated HR source of truth |
+| Policy chunks and incident memory | Chroma | RAG retrieval and episodic warm-start |
+| RL policy | `data/rl_policy.npz` plus SQLite reward tables | Persist learned behavior and audit reward history |
+| Trace and cost events | JSONL plus SQLite indexes | Live UI, eval assertions, cost comparison, debugging |
+| Compliance rules | YAML | Auditable hard-veto logic outside prompts |
+
+### 3.3 Safety Invariants
+
+- Sub-agents never call each other; all communication happens through `GraphState`.
+- The LLM never directly executes tools; it can only produce structured proposals that pass validation, compliance, and risk gates.
+- Compliance hard vetoes are final and feed negative reward back into RL.
+- Low-confidence or high-risk actions pause for human review.
+- Timeout never auto-corrects; it falls back to `flag-for-audit`.
+- Learned RL policy ranks actions but cannot bypass compliance, HITL, tool schemas, or idempotency checks.
 
 ## 4. Core State and Routing
 
@@ -82,6 +198,21 @@ class Signal(BaseModel):
 The graph state contains the signal, extracted intent, retrieved policy chunks, detected anomalies, proposed action, compliance result, HITL decision, tool results, RL context vector, selected arm, reward events, and transition log.
 
 The LangGraph checkpointer is keyed by `thread_id`, so multi-turn reactive sessions and paused HITL runs survive process restarts. The Supervisor is intentionally thin. Scheduled and system-generated signals route deterministically to anomaly investigation. Reactive requests use a small LLM call with structured output to classify intent as policy lookup, action request, anomaly report, or mixed. Mixed requests fan out through the graph, but agents never call each other directly.
+
+The contract surface is intentionally explicit:
+
+| Interface | Producer | Consumer | Purpose |
+|---|---|---|---|
+| `Signal` | Trigger layer | Supervisor | Normalize reactive, scheduled, and system-generated inputs |
+| `PolicyAnswer` | Policy Agent | HITL/final response/anomaly context | Ground answers and decisions in cited policy chunks |
+| `Anomaly` | Anomaly Agent | Memory/RL/HITL | Carry evidence, confidence, severity, and candidate actions |
+| `BanditDecision` | RL Action Ranker | Compliance/HITL/diagnostics | Store ranked actions and sampled/posterior scores |
+| `ComplianceResult` | Compliance Agent | HITL/Action Agent/RL rewards | Enforce approval requirements and hard vetoes |
+| `ReviewPacket` | HITL Gate | Reviewer UI/API | Present context for approve/reject/modify decisions |
+| `IncidentResolution` | Memory Write | Chroma episodic memory | Store resolved precedent for future warm-start |
+| `RewardEvent` | HITL/outcome/compliance hooks | RL policy store | Update learned action policy |
+
+Full Python definitions and JSON examples are in `docs/interface-contracts.md`.
 
 ## 5. Agents
 
@@ -221,15 +352,139 @@ ui/               # Streamlit ops console and approvals
 scripts/          # seed data, build index, run demo cycles, diagnostics
 evals/            # 15-case harness and reviewer personas
 data/             # SQLite, checkpoints, Chroma, traces, learned RL policy
+docs/             # assignment PDF, interface contracts, LLM instruction contracts
 ```
 
-## 12. Hardest Tradeoffs
+## 12. Technology Tradeoffs and Rationale
 
-**Bandit over REINFORCE:** The system learns action selection rather than long-horizon routing strategy. That is the right trade for the assignment because action choice has clear rewards, five discrete arms, and limited feedback cycles.
+The main design bias is: use boring, inspectable infrastructure for the demo, and spend complexity only where the assignment explicitly evaluates it - stateful agent orchestration, grounded RAG, HITL, compliance vetoes, episodic memory, and a real RL feedback loop.
 
-**Deterministic anomaly detection and compliance:** This sacrifices open-ended LLM discovery of novel anomaly types, but it gives auditability, calibration, repeatability, and most of the cost reduction.
+### 12.1 Agent Orchestration: LangGraph
 
-**Embedded local stack:** SQLite, Chroma, APScheduler, and Streamlit minimize demo friction and make persistence easy to inspect. At production scale these become Postgres, a durable queue/workflow engine, a managed vector store, and a real reviewer console.
+| Option | Pros | Cons |
+|---|---|---|
+| LangGraph `StateGraph` | Native shared state, conditional routing, checkpointing, interrupt/resume support, and a clean way to prove "no direct agent-to-agent calls" | Extra dependency; API surface is more complex than a simple loop |
+| Hand-rolled state machine | Maximum control, fewer dependencies, easy to debug for a tiny prototype | We would need to rebuild checkpointing, HITL pause/resume, transition logging, and graph replay - exactly the features being evaluated |
+| CrewAI/AutoGen | Fast conversational agent demos | These frameworks naturally encourage agent-to-agent conversations, which conflicts with the assignment's hard state-graph requirement |
+
+**Decision:** use LangGraph. It maps directly to the required architecture: Supervisor routes, sub-agents write to shared state, all transitions are logged, and HITL can pause without blocking a process thread.
+
+**Accepted tradeoff:** some graph boilerplate. This is worth it because the boilerplate is visible proof of the architecture constraint rather than hidden framework magic.
+
+### 12.2 LLM Integration: Thin Provider Client, Not Full LangChain
+
+| Option | Pros | Cons |
+|---|---|---|
+| Raw provider SDK behind `llm/client.py` | Full control over structured outputs, token usage, cache policy, model tiering, and cost accounting | We write small wrappers for retries, parsing, and tracing |
+| LangChain chains everywhere | Lots of ready-made abstractions for prompts, retrievers, and chains | Harder to keep exact token accounting and cache behavior; can obscure which call made which decision |
+| Provider-agnostic abstraction from day one | Easier future vendor swap | Adds indirection before the product requirements are stable |
+
+**Decision:** use a thin LLM client module. Machine-consumed outputs are structured with schemas, every call is costed centrally, and deterministic nodes avoid LLM calls entirely.
+
+**Accepted tradeoff:** mild provider coupling. The code isolates that coupling in one module, which is enough for the assignment and keeps cost optimization measurable.
+
+### 12.3 RL Algorithm: Contextual Bandit
+
+| Option | Pros | Cons |
+|---|---|---|
+| Linear Thompson-sampling contextual bandit | Sample-efficient, interpretable, easy to persist, and directly learns which of the 5 actions to rank first | Only learns a one-step action decision, not full long-horizon workflow strategy |
+| LinUCB | Also sample-efficient and interpretable | Requires exploration tuning; warm-starting from episodic memory is less natural |
+| PPO/REINFORCE on Supervisor routing | More general sequential learning story | Needs far more episodes; demo changes after 2 cycles would likely be noisy or artificial |
+| Prompt-only feedback memory | Very simple | Not a real learning signal and explicitly would not satisfy the assignment |
+
+**Decision:** use Thompson sampling over deterministic context features. The action space is small, rewards are clear, and the Loom can show posterior movement plus action-distribution shift after two feedback cycles.
+
+**Accepted tradeoff:** it optimizes action recommendations, not the whole graph policy. That is intentional: routing is mostly deterministic from trigger type, while action choice has meaningful human feedback.
+
+### 12.4 Anomaly Detection: Deterministic Statistics Before LLMs
+
+| Option | Pros | Cons |
+|---|---|---|
+| Pandas/numpy detectors with calibration | Reproducible, auditable, cheap, and easy to validate against seeded ground truth | Detects known anomaly classes rather than inventing new ones |
+| LLM-based anomaly scoring | Flexible and easy to explain in natural language | Non-deterministic, hard to calibrate, expensive for scans, and risky for payroll/compliance claims |
+| Unsupervised ML models such as Isolation Forest | Can find unfamiliar outliers | Harder to explain to HR reviewers; still needs calibration and per-cohort tuning |
+
+**Decision:** use deterministic detectors for payroll, leave, and compliance anomalies. The LLM can narrate evidence for humans, but it does not decide that a payroll anomaly exists.
+
+**Accepted tradeoff:** less open-ended discovery. For production, an unsupervised "suggestion only" detector could feed `flag-for-audit`, but automatic action should stay grounded in explainable signals.
+
+### 12.5 Persistence: SQLite plus Files
+
+| Option | Pros | Cons |
+|---|---|---|
+| SQLite, JSONL, and `rl_policy.npz` | Zero ops, inspectable, transactional enough for local demo, survives restarts, easy for reviewers to query | Not ideal for multi-process or high-concurrency production workloads |
+| Postgres | Strong concurrency, operational familiarity, natural production fit | Adds setup friction for the assignment and makes the local demo heavier |
+| In-memory state | Fastest to prototype | Fails the persistence requirement for RL and HITL |
+
+**Decision:** use SQLite for application state, approval queues, reward audit trails, cost ledger, and LangGraph checkpoints; use `rl_policy.npz` for compact bandit matrices.
+
+**Accepted tradeoff:** single-process bias. This is fine for the assignment because persistence and inspectability matter more than horizontal scale.
+
+### 12.6 Vector Store and Embeddings: Chroma plus Local Embeddings
+
+| Option | Pros | Cons |
+|---|---|---|
+| Chroma embedded store | Local, persistent, no service dependency, good enough for small policy and incident corpora | Weaker filtering and scaling story than dedicated vector databases |
+| Qdrant | Better production vector database with stronger filtering and indexing | Requires running and configuring another service |
+| pgvector | Keeps vectors and relational metadata together | Needs Postgres and more setup |
+| Hosted embeddings | Strong quality on broad corpora | API cost, network dependency, and less deterministic local evaluation |
+| Local sentence-transformer embeddings | Free, reproducible, offline, fast for small corpora | Lower quality than top hosted embedding models on long or messy text |
+
+**Decision:** use Chroma with local embeddings for both policy RAG and episodic memory. The corpus is intentionally small: 3-5 pages of policy plus resolved incidents.
+
+**Accepted tradeoff:** not the final production vector architecture. At scale, this becomes Qdrant or pgvector with tenant namespaces, PII controls, and lifecycle policies.
+
+### 12.7 API and Reviewer UI: FastAPI plus Streamlit
+
+| Option | Pros | Cons |
+|---|---|---|
+| FastAPI | Typed request/response models, async support, automatic OpenAPI spec, good mock-tool ergonomics | More structure than a tiny Flask app |
+| Flask | Very small and familiar | Less schema-first by default; more manual OpenAPI work |
+| Django | Batteries included | Too heavy for a prototype mock API and agent service |
+| Streamlit | Fast Python-only reviewer UI, good for showing traces and HITL packets in a demo | Less polished and less customizable than a real React product UI |
+| React | Production-grade UI flexibility | Slower to build; adds a separate frontend stack not central to the assignment |
+
+**Decision:** FastAPI for mock upstream APIs, action tools, alert intake, and approval endpoints; Streamlit for the ops console and approval queue.
+
+**Accepted tradeoff:** the UI is demo-grade. The APIs are still clean enough that a production React console can replace Streamlit later.
+
+### 12.8 Scheduling and Feedback Cycles: APScheduler plus Logical Cycles
+
+| Option | Pros | Cons |
+|---|---|---|
+| APScheduler | Simple in-process cron, no broker, easy demo setup | Not a distributed scheduler |
+| Celery or RQ | Durable background jobs and retries | Requires broker/worker setup; heavier than needed |
+| System cron | Simple operational model | Harder to coordinate with app state and demo cycle controls |
+| Logical cycle counter | Deterministic evals and fast two-cycle RL demo | Less realistic than waiting on wall-clock time |
+
+**Decision:** APScheduler handles real scheduled jobs and timeout sweeps, while the demo/eval uses a logical `cycle` integer for recurrence windows and feedback comparisons.
+
+**Accepted tradeoff:** simulated time is less production-real, but it makes before/after RL behavior reproducible and easy to grade.
+
+### 12.9 Compliance Engine: YAML Rules plus Safe Expression Evaluation
+
+| Option | Pros | Cons |
+|---|---|---|
+| YAML/JSON rules with a small evaluator | Auditable, editable without prompt changes, versionable, and directly satisfies the assignment | Less expressive than arbitrary code |
+| Python rule functions | Maximum flexibility and testability | Rules become code, not configuration; harder for HR/legal stakeholders to review |
+| LLM-as-compliance-judge | Easy to add natural-language nuance | Unsafe for hard vetoes; non-deterministic and hard to audit |
+| Business rules engine | Mature rule management | Adds operational complexity for a small ruleset |
+
+**Decision:** use 10-15 YAML rules evaluated by a constrained expression engine over `{employee, anomaly, action}`. All matching rules are logged; any hard veto blocks execution.
+
+**Accepted tradeoff:** rules are intentionally simple. This is a good thing for compliance: hard vetoes should be predictable, tested, and boring.
+
+### 12.10 Observability: JSONL, SQLite Metrics, and Optional UI
+
+| Option | Pros | Cons |
+|---|---|---|
+| JSONL traces plus SQLite indexes | Easy to inspect, diff, test, and show in a demo | Not a full distributed tracing stack |
+| OpenTelemetry from day one | Production-grade trace correlation | More setup and viewer infrastructure than the assignment needs |
+| Console logs only | Minimal effort | Hard to power eval assertions, cost reports, and live trace UI |
+
+**Decision:** every node emits structured trace events to JSONL and SQLite. This supports the assignment's required trace fields, eval assertions, cost accounting, and live reasoning trace.
+
+**Accepted tradeoff:** local observability only. In production, the same event shape can be exported through OpenTelemetry.
 
 ## 13. Production Path
 
