@@ -8,8 +8,8 @@ The implementation is a single Python 3.11+ repo with generated mock artifacts: 
 
 Companion contract docs:
 
-- `docs/interface-contracts.md` defines the Pydantic interfaces and example payloads for signals, RAG chunks, anomalies, RL decisions, HITL packets, incidents, resolutions, rewards, tools, and graph state.
-- `docs/llm-instructions.md` defines the LLM instruction contracts and structured outputs for Supervisor triage, RAG synthesis, verification, reviewer narrative, and final user response.
+- [interface-contracts.md](interface-contracts.md) defines the Pydantic interfaces and example payloads for signals, RAG chunks, anomalies, RL decisions, HITL packets, incidents, resolutions, rewards, tools, and graph state.
+- [llm-instructions.md](llm-instructions.md) defines the LLM instruction contracts and structured outputs for Supervisor triage, RAG synthesis, verification, reviewer narrative, and final user response.
 
 ## 2. Requirement Mapping
 
@@ -212,7 +212,7 @@ The contract surface is intentionally explicit:
 | `IncidentResolution` | Memory Write | Chroma episodic memory | Store resolved precedent for future warm-start |
 | `RewardEvent` | HITL/outcome/compliance hooks | RL policy store | Update learned action policy |
 
-Full Python definitions and JSON examples are in `docs/interface-contracts.md`.
+Full Python definitions and JSON examples are in [interface-contracts.md](interface-contracts.md).
 
 ## 5. Agents
 
@@ -352,7 +352,9 @@ ui/               # Streamlit ops console and approvals
 scripts/          # seed data, build index, run demo cycles, diagnostics
 evals/            # 15-case harness and reviewer personas
 data/             # SQLite, checkpoints, Chroma, traces, learned RL policy
-docs/             # assignment PDF, interface contracts, LLM instruction contracts
+docs/             # assignment PDF only
+interface-contracts.md
+llm-instructions.md
 ```
 
 ## 12. Technology Tradeoffs and Rationale
