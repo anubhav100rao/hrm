@@ -10,6 +10,7 @@ Companion contract docs:
 
 - [interface-contracts.md](interface-contracts.md) defines the Pydantic interfaces and example payloads for signals, RAG chunks, anomalies, RL decisions, HITL packets, incidents, resolutions, rewards, tools, and graph state.
 - [llm-instructions.md](llm-instructions.md) defines the LLM instruction contracts and structured outputs for Supervisor triage, RAG synthesis, verification, reviewer narrative, and final user response.
+- [design-rationale.md](design-rationale.md) records the reasoning behind the contested design choices as Architecture Decision Records (exploration safety, pseudo-observation math, reward-hacking mitigations, compliance exceptions) plus a risk-and-operability register (capacity, degradation, drift, erasure).
 
 ## 2. Capability Mapping
 
@@ -218,11 +219,24 @@ Full Python definitions and JSON examples are in [interface-contracts.md](interf
 
 **Policy Agent:** Retrieves from the HR policy corpus using a managed vector store. Policies are split by markdown headings and clauses so numeric limits stay with their conditions. The agent returns cited answers only; if retrieved chunks do not support an answer, it says the policy corpus does not cover the question. A verifier checks that claims are entailed by cited chunks.
 
+Every retrieval pins the resolved `policy_version` (and chunk revision IDs) into `GraphState`. A run uses the policy in effect **at detection time** for the entire lifecycle, even if the corpus is updated while the run is paused in HITL — this keeps the cited answer, the compliance evaluation, and the executed action internally consistent. If the corpus changes a threshold the run depended on, the action execution step re-validates the pinned `policy_version` against the live rule registry and, on mismatch, re-routes to HITL rather than acting on stale policy.
+
 **Anomaly Detection Agent:** Uses deterministic pandas/numpy detectors, not LLM judgment. Payroll outliers use robust z-scores within peer cohorts such as department, band, and country. Leave abuse uses clustering around weekends/holidays, policy-limit pressure, and threshold-gaming patterns. Compliance violations include missing training, overtime cap breaches, probation constraints, and correction-window issues.
 
 **Compliance Agent:** Evaluates every proposed action against YAML rules before execution. Rules include overtime caps, leave notice periods, probation restrictions, payroll correction tiers, mandatory training gates, retro-correction windows, and double-correction locks. A hard veto blocks the action even if RL, the Supervisor, or a human reviewer preferred it.
 
+**Jurisdiction resolution** is explicit, not inferred. The applicable jurisdiction set is derived from the employer legal entity that pays the employee (primary), the employee's registered work location, and data-residency region — resolved in that precedence order from HRIS master data and pinned into `GraphState` at detection time. When two jurisdictions both assert a rule (for example a cross-border remote worker), the evaluator takes the **union of all matching hard vetoes** (most restrictive wins) and flags the conflict to HITL when the rule sets disagree on a non-veto requirement. Jurisdiction is never guessed by the LLM.
+
+**Rule change control:** `rules.yaml` lives in the versioned rule registry, not in code or prompts. Changes require a pull request with compliance/legal sign-off, must pass the offline compliance regression fixtures (§10), and are promoted through the same canary path as policy changes. Each rule carries a unique ID, effective-date range, and owning jurisdiction; a deploy that would disable an existing veto or match zero rules for a previously covered case fails the regression gate. Blast radius is bounded by evaluating new rule versions in shadow mode against live traffic before promotion.
+
 **Action Agent:** Executes only compliance-approved actions through production integration adapters: payroll adjustment, leave flag, ticket escalation, audit log, and training enrollment. Guardrails include JSON-schema validation, idempotency keys, parameter re-checks, retries for transient failures, circuit breakers, and sandbox mode for pre-production validation.
+
+The idempotency key is deterministic and content-addressed: `sha256(tenant_id, anomaly_id, action_type, target_resource_id, policy_version, correction_period)`. It is derived from the decision, not generated per attempt, so a retry, a duplicate scan, or a worker failover that replays the same decision produces the same key. The Action Agent persists `(idempotency_key -> outcome)` in Postgres in the same transaction that records the side-effect intent, and replays the stored outcome on a repeated key instead of re-issuing the call. Two execution modes exist depending on the downstream integration:
+
+- **Idempotent downstream (preferred):** the key is forwarded to the payroll/ticketing API, which dedupes server-side. Safe under at-least-once delivery.
+- **Non-idempotent downstream:** the adapter uses a local claim-check — write `key=in_flight` before the call, reconcile after. If the worker crashes after the call but before reconciliation, recovery does **not** blind-retry; it transitions the action to `flag-for-audit` and surfaces an "unverified side effect" incident for a human to reconcile against the downstream system of record. This trades a rare manual reconciliation for never double-paying.
+
+Because a corrupted or double-executed action would poison the delayed reward (§7), every executed action carries its `idempotency_key` into the reward event, and the outcome checker discards reward attribution for any action whose key shows more than one settled side effect.
 
 **Memory Nodes:** Retrieve and write resolved incidents. Memory is not used as untrusted free text for tools; it biases ranking and helps humans see precedents.
 
@@ -250,6 +264,11 @@ confidence = clamp01(calibrated_signal_strength * data_quality * corroboration_b
 
 `calibrated_signal_strength` and `data_quality` are each in `[0, 1]`. `corroboration_boost` is a bounded multiplier in `[1.0, 1.0 + MAX_BOOST]`, and the final product is clamped to `[0, 1]` so it always honors the `confidence: Field(ge=0, le=1)` contract. Signal strength comes from detector-specific statistics, such as robust z-score magnitude or tail probability. Data quality penalizes small cohorts, missing fields, and legitimate context changes. Corroboration increases confidence when independent signals agree, for example payroll delta plus unmatched overtime data, but the cap prevents corroboration alone from making a weak anomaly look certain.
 
+**Calibration is a real statistical fit, not just the product above.** `calibrated_signal_strength` is produced by mapping the raw detector statistic through a per-detector, per-tenant **isotonic regression** (monotonic, non-parametric — preferred over Platt scaling because detector-score-to-incidence is rarely sigmoidal) fitted on labeled historical outcomes. "Calibrated" means the operational target: anomalies scored in a 0.8 confidence bucket are confirmed true roughly 80% of the time. We track this with reliability diagrams and Expected Calibration Error (ECE) per detector and tenant, refit on a rolling window monthly (or on drift-detector trigger), and gate refits through the same backtest promotion path as any policy change (§10). Two pitfalls are handled deliberately:
+
+- **Reviewer-anchoring loop.** Reviewers see the confidence score in the HITL packet, so calibrating purely against their decisions would be circular. The calibration label of record is the *independent ground truth* — payroll audit outcome, recurrence, or a blind second review — not the anchored first-reviewer click. Reviewer agreement is monitored separately as a quality metric, not used as the calibration target.
+- **Corroboration double-counting.** Memory contributes to confidence *only* through the capped precedent term inside `corroboration_boost`; the same precedent's effect on action ranking flows through the bandit pseudo-observations (§8). The two paths are kept separate by construction so a single precedent cannot simultaneously inflate confidence and the action posterior beyond its capped weight. See [design-rationale.md](design-rationale.md) for the bookkeeping.
+
 The five action arms are:
 
 1. `auto-correct`
@@ -268,6 +287,8 @@ Algorithm: linear Thompson-sampling contextual bandit.
 
 Context features are deterministic: anomaly type, confidence, severity, amount bucket, department hash, tenure bucket, probation flag, prior incident count, detector corroboration count, data-quality score, and cycle phase. The feature vector does not include free-form LLM text.
 
+**Fairness and adverse-action auditing.** Features such as `department_hash` and `tenure_bucket` are operationally predictive but can act as proxies for protected characteristics, and a learned policy that escalates one cohort more often is an adverse-action pattern. Three controls apply: (1) protected attributes (and direct proxies like age, gender, ethnicity, nationality) are never features; (2) a scheduled fairness audit slices action distribution, approval rate, and veto rate by cohort and flags disparate impact beyond a configured threshold, treated as a policy-promotion blocker; (3) because the bandit is *linear*, its per-feature weights are directly inspectable, so a feature trending toward a protected proxy is caught in RL diagnostics (§10) rather than discovered after harm. The compliance and HITL gates remain the backstop: the bandit only ranks; it cannot take an adverse action a human and the rules did not allow.
+
 Reward sources:
 
 | Source | Event | Reward |
@@ -280,6 +301,8 @@ Reward sources:
 | Outcome | auto-correct does not recur within N cycles | positive delayed reward |
 | False positive | reviewer or audit labels anomaly as legitimate/data error | negative reward |
 | Compliance | proposed action receives a hard veto | `-1.0` |
+
+`N` is the recurrence-observation horizon, set per anomaly type to one full correction cycle plus a grace window (payroll: `N = 2` monthly cycles; leave: `N = 1` quarter), long enough that a genuine fix would have surfaced a relapse but short enough to keep the learning signal timely. Recurrence is not assumed to mean "wrong action": the outcome checker re-runs the detector at horizon end and attributes a negative delayed reward only when the *same* anomaly signature recurs for the *same* employee with no intervening legitimate context change (transfer, band change, policy update). Genuine context changes void the attribution rather than penalizing the earlier action.
 
 Rewards are summed per decision and clipped to keep a single event from destabilizing the policy. Every posterior update is persisted to the policy store and mirrored into an auditable reward ledger. Worker restarts reload the learned policy; they do not reset behavior.
 
@@ -360,6 +383,7 @@ README.md
 architecture.md
 interface-contracts.md
 llm-instructions.md
+design-rationale.md
 ```
 
 ## 12. Technology Tradeoffs and Rationale
@@ -378,6 +402,12 @@ The main design bias is: use auditable, horizontally scalable infrastructure for
 **Decision:** use LangGraph for the agent state graph and back it with durable Postgres checkpoints. For long-running schedules, retries, and operational timers, wrap graph execution in a durable worker runtime such as Temporal or an equivalent internal workflow platform.
 
 **Accepted tradeoff:** two layers of orchestration. LangGraph owns semantic state transitions; the durable runtime owns retries, timers, queues, and worker lifecycle.
+
+**Source-of-truth boundary (avoiding double execution).** The LangGraph Postgres checkpoint is the single source of truth for *graph state*; the durable runtime is the source of truth only for *scheduling and delivery* (when to run, retry, or time out). The two never both decide what executed. The boundary holds via three rules:
+
+- **Nodes are replay-safe.** A node reads its inputs from the checkpoint, and a side-effecting node (only the Action Agent) guards execution with the content-addressed idempotency key (§5). If the durable runtime retries an activity after the checkpoint already advanced, the node sees the committed state and the stored idempotency outcome, and replays the result instead of re-acting.
+- **One timer owner per concern.** HITL pause/resume and timeout are owned by the durable runtime (it is the only component that reliably survives multi-day waits and worker death); LangGraph's `interrupt()` only persists the *paused* state. The timeout fallback to `flag-for-audit` is executed by a durable timer that resumes the checkpoint, so it fires exactly once even if the original worker is gone. LangGraph does not run its own competing timer.
+- **In-flight schema migration.** State schemas and the graph are versioned, and every checkpoint records the `graph_version` that wrote it. A run resumes on the version it started with (pinned), so a run paused in HITL under v1 completes on v1 even after v2 deploys. Breaking changes ship a forward migration that is applied to a checkpoint lazily on resume and validated against the target schema; if migration is not possible, the run is failed safe to `flag-for-audit` rather than executed under an ambiguous schema. New behavior reaches in-flight runs only through explicit migration, never by silent reinterpretation.
 
 ### 12.2 LLM Integration: Governed Gateway and Thin Client
 
@@ -508,6 +538,8 @@ Production readiness depends on reliability, governance, and tenant isolation as
 | Data | Tenant-isolated access, warehouse backtests, feature-store lineage, drift monitors |
 | RL | Hierarchical policy: global prior plus tenant posterior, off-policy evaluation before promotion |
 | Memory | Tenant namespaces, PII minimization, retention policies, deletion workflows |
+| Tenant isolation | Namespace + row-level-security per store, enforced by a shared access layer; a cross-tenant retrieval test runs in CI and as an online canary — any result carrying a foreign `tenant_id` fails the build and pages |
+| Data erasure (GDPR/DSR) | Per-subject deletion sweep across warehouse, incident-memory embeddings, and checkpoints; reward ledger and audit ledger are retained under legal basis but **pseudonymized** (subject ID tombstoned), since the bandit learned from aggregate features and is not retrained per erasure — see [design-rationale.md](design-rationale.md) |
 | HITL | SLA-aware reviewer queues, role-based approvals, four-eyes controls, escalation paths |
 | Compliance | Versioned jurisdiction rule registry, legal review, unit tests, release approvals |
 | LLM ops | Gateway budgets, rate limits, prompt release gates, data residency controls |
